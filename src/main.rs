@@ -1,11 +1,17 @@
 use std::io::Cursor;
+use whatlang::detect;
+use syllarust::estimate_syllables;
+use std::fs::OpenOptions;
+use std::io::Write;
 
 use atrium_api::{
-    app::bsky::feed::post,
+    app::bsky::{
+        feed::{post, like, repost},
+        graph::follow,
+    },
     com::atproto::sync::subscribe_repos::Commit,
-    types::{CidLink, Collection},
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 
 use ipld_core::ipld::Ipld;
 use native_tls::TlsConnector;
@@ -13,11 +19,43 @@ use tokio_tungstenite::{
     tungstenite::{client::IntoClientRequest, http::HeaderValue, Message},
     Connector,
 };
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 const FIREHOSE_URL: &str = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos";
 const USER_AGENT: &str =
     "bsky-firehose-listener (https://github.com/angeloanan/bsky-firehose-listener)";
+
+fn is_english(text: &str) -> bool {
+    detect(text).map_or(false, |info| info.lang() == whatlang::Lang::Eng)
+}
+
+fn is_haiku(text: &str) -> bool {
+    let lines: Vec<String> = if text.contains('\n') {
+        text.lines().map(|s| s.to_string()).collect()
+    } else {
+        text.split_whitespace()
+            .collect::<Vec<&str>>()
+            .chunks(5)
+            .map(|chunk| chunk.join(" "))
+            .collect::<Vec<String>>()
+    };
+
+    if lines.len() != 3 {
+        return false;
+    }
+
+    let syllables: Vec<usize> = lines.iter().map(|line| estimate_syllables(&line)).collect();
+    syllables == vec![5, 7, 5]
+}
+
+fn save_haiku_to_file(haiku: &str, cid: &str) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("haikus.txt")?;
+    writeln!(file, "CID: {}\n{}\n", cid, haiku)?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() {
@@ -48,22 +86,12 @@ async fn main() {
         let msg = msg.unwrap();
         match msg {
             Message::Binary(data) => {
-                // Handle each binary data in a separate task
                 tokio::task::spawn(async move {
-                    // On a single WS binary data, message will contain two ipld dagcbor frames:
-                    // The first frame is the type of message (metadata)
-                    // The second frame is the actual data of the message
-                    //
-                    // We need to split the data into two parts but don't know the size of each
-                    // frame ahead of time. For now, we'll just try to parse the data as-is; We'll
-                    // exploit how std::io::Cursor's position will be updated when we read from it.
-                    let buf = data.clone();
                     let mut cursor = Cursor::new(data.as_slice());
                     serde_ipld_dagcbor::from_reader::<Ipld, _>(&mut cursor)
                         .expect_err("Somehow bsky only sends 1 frame.");
                     let (metadata, data) = data.split_at(cursor.position() as usize);
 
-                    // Parse the metadata half
                     let Ipld::Map(map) = serde_ipld_dagcbor::from_slice::<Ipld>(metadata)
                         .expect("Valid data turns out to be invalid")
                     else {
@@ -71,9 +99,6 @@ async fn main() {
                         return;
                     };
 
-                    // Parse `op`
-                    //  1 = Message
-                    // -1 = Error
                     let Ipld::Integer(op_id) =
                         map.get("op").expect("Malformed frame, \"op\" is missing")
                     else {
@@ -86,7 +111,6 @@ async fn main() {
                         return;
                     }
 
-                    // Parse `t`: https://github.com/bluesky-social/atproto/blob/c307a75db11503eedf743c01e62f90413f07fe2a/lexicons/com/atproto/sync/subscribeRepos.json#L20-L27
                     let Ipld::String(message) =
                         map.get("t").expect("Malformed frame, \"t\" is missing")
                     else {
@@ -94,31 +118,20 @@ async fn main() {
                         return;
                     };
 
-                    // Only going to parse #commit
-                    // info!("Received message from Firehose: {:?}", message);
                     if message != "#commit" {
                         return;
                     }
 
-                    // Parse the data half
                     let commit = serde_ipld_dagcbor::from_slice::<Commit>(data)
                         .expect("Malformed bsky \"#commit\" data");
 
-                    // Parse CAR file
                     let (items, _header) =
                         rs_car::car_read_all(&mut commit.blocks.as_slice(), true)
                             .await
                             .expect("CAR file is invalid");
                     let items_iter = items.iter();
                     for operation in &commit.ops {
-                        // Only parse CREATE action
                         if operation.action != "create" {
-                            continue;
-                        }
-
-                        // Only parse post
-                        if !operation.path.starts_with("app.bsky.feed.post") {
-                            // info!("Skipping non-post: {:?}", operation.path);
                             continue;
                         }
 
@@ -130,15 +143,43 @@ async fn main() {
                             continue;
                         };
 
-                        let record =
-                            serde_ipld_dagcbor::from_reader::<post::Record, _>(data.as_slice())
-                                .expect("Malformed bsky \"#commit\" data");
-                        info!(
-                            "{} {:?} - {}",
-                            operation.action.to_uppercase(),
-                            operation.cid,
-                            record.text
-                        )
+                        match operation.path.as_str() {
+                            path if path.starts_with("app.bsky.feed.post") => {
+                                if let Ok(record) = serde_ipld_dagcbor::from_reader::<post::Record, _>(data.as_slice()) {
+                                    //do the things
+                                    if is_english(&record.text) && is_haiku(&record.text) {
+                                        info!("New haiku found:");
+                                        for line in record.text.lines() {
+                                            info!("{}", line);
+                                        }
+                                        if let Err(e) = save_haiku_to_file(&record.text, &operation.cid.as_ref().unwrap().0.to_string()) {
+                                            error!("Failed to save haiku: {:?}", e);
+                                        } else {
+                                            info!("Haiku saved to file");
+                                        }
+                                    }
+                                    info!("New post: {:?} - {}", operation.cid, record.text);
+                                }
+                            },
+                            path if path.starts_with("app.bsky.feed.like") => {
+                                if let Ok(record) = serde_ipld_dagcbor::from_reader::<like::Record, _>(data.as_slice()) {
+                                    info!("New like: {:?} - Subject: {}", operation.cid, record.subject.uri);
+                                }
+                            },
+                            path if path.starts_with("app.bsky.feed.repost") => {
+                                if let Ok(record) = serde_ipld_dagcbor::from_reader::<repost::Record, _>(data.as_slice()) {
+                                    info!("New repost: {:?} - Subject: {}", operation.cid, record.subject.uri);
+                                }
+                            },
+                            path if path.starts_with("app.bsky.graph.follow") => {
+                                if let Ok(record) = serde_ipld_dagcbor::from_reader::<follow::Record, _>(data.as_slice()) {
+                                    info!("New follow: {:?} - Subject: {:?}", operation.cid, record.subject);
+                                }
+                            },
+                            _ => {
+                                info!("Unknown event type: {}", operation.path);
+                            }
+                        }
                     }
                 });
             }
